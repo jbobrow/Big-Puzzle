@@ -40,6 +40,7 @@ Color gameColors[NUM_GAME_COLORS+1] = {OFF, TANGERINE, LEMON, MINT, GRAPE};  // 
 #define COMM_WIN_RESOLVE     22
 
 #define MAX_SOLVE_DISTANCE  15  // Maximum distance we can represent
+#define MAX_NEG_NUM 100
 
 #define PERIOD_DURATION 2000
 #define BUFFER_DURATION 200
@@ -60,6 +61,66 @@ enum Mode {
   WIN
 };
 
+struct Neighbor {
+  byte faceColor;           // Color on connected face
+  byte signatureColors[FACE_COUNT]; // Full color signature of neighbor
+  
+  void clear() {
+    faceColor = 0;
+    for (byte i = 0; i < FACE_COUNT; i++) {
+      signatureColors[i] = 0;
+    }
+  }
+  
+  bool isEmpty() const {
+    return faceColor == 0;
+  }
+  
+  bool matches(const Neighbor& other) const {
+    if (faceColor != other.faceColor) return false;
+    for (byte i = 0; i < FACE_COUNT; i++) {
+      if (signatureColors[i] != other.signatureColors[i]) return false;
+    }
+    return true;
+  }
+};
+
+struct FaceState {
+  Neighbor currentNeighbor;         // Current neighbor data
+  Neighbor solutionNeighbor;        // Locked-in solution
+  byte negotiationNum;      // Random number for color negotiation
+  byte proposedColor;       // Our proposed color
+  byte myColor;
+  
+  enum NegState {
+    NEG_IDLE,
+    NEG_SENT,
+    NEG_RECEIVED,
+    NEG_COMPLETE
+  } negotiationState;
+  
+  enum SigState {
+    SIG_NONE,
+    SIG_SENT,
+    SIG_RECEIVED
+  } signatureState;
+  
+  void reset() {
+    currentNeighbor.clear();
+    solutionNeighbor.clear();
+    negotiationNum = 0;
+    proposedColor = 0;
+    myColor = 0;
+    negotiationState = NEG_IDLE;
+    signatureState = SIG_NONE;
+  }  
+};
+
+enum PacketType {
+  PKT_NEGOTIATE_COLOR = 0,
+  PKT_COLOR_SIGNATURE = 1
+};
+
 State signalState = INERT;
 
 Mode gameMode = SETUP;//the default mode when the game begins
@@ -70,8 +131,19 @@ byte brightness; // synchronized brightness
 
 bool amISolved = false;
 
-void setup() {
+FaceState faces[FACE_COUNT];
 
+byte myColors[FACE_COUNT];
+
+bool readyToSolve;
+
+// =========================================================
+// =============    MAIN SETUP & LOOP      =================
+// =========================================================
+
+void setup() {
+  randomize();
+  changeMode(SETUP);  // START IN SETUP
 }
 
 void loop() {
@@ -79,6 +151,9 @@ void loop() {
   // sync the animations
   syncLoop();
   brightness = sin8_C(map(syncTimer.getRemaining(), 0, PERIOD_DURATION, 0, 255));
+  
+  // listen for packets
+  processIncomingPackages();
 
   // The following listens for and updates game state across all Blinks
   switch (signalState) {
@@ -119,12 +194,29 @@ void loop() {
 */
 void setupLoop() {
 
-  // press to start
-  if (buttonPressed()) {
+  // double click to start
+  if (buttonDoubleClicked()) {
     changeMode(PLAY);  // change game mode on all Blinks
   }
 
-  setColor(dim(RED,brightness));
+  FOREACH_FACE(f) {
+    if (!isValueReceivedOnFaceExpired(f)) { // a neighbor!
+      if (faces[f].currentNeighbor.isEmpty()) {  // a new neighbor!
+        if(faces[f].negotiationState == FaceState::NEG_IDLE) {
+          faces[f].negotiationNum = random(MAX_NEG_NUM);
+          faces[f].proposedColor = 1 + random(NUM_GAME_COLORS - 1);
+          sendNegotiationPacket(f, faces[f].proposedColor, faces[f].negotiationNum);
+          faces[f].negotiationState = FaceState::NEG_SENT;
+        }
+      }
+    }
+    else { // no neighor
+      faces[f].reset();
+    }
+
+    // display color on face
+    setColorOnFace(dim(gameColors[faces[f].myColor], 127 + brightness/2),f);
+  }
 }
 
 /*
@@ -178,17 +270,7 @@ void winLoop() {
     setWinAnimationTimer();
   }
 
-  // switch(winAnimationPlayhead) {
-  //   case 0: setColor(ORANGE); break;
-  //   case 1: setColor(YELLOW); break;
-  //   case 2: setColor(GREEN); break;
-  //   case 3: setColor(CYAN); break;
-  //   case 4: setColor(BLUE); break;
-  //   default: setColor(MAGENTA);
-  // }
   displayWinAnimation();
-
-  // setColor(dim(BLUE,brightness));
 }
 
 uint8_t easeInHelper(uint8_t A) {
@@ -198,40 +280,29 @@ uint8_t easeInHelper(uint8_t A) {
 }
 
 void displayWinAnimation() {
-  switch(winAnimationPlayhead) {
-    case 0:
-      { 
-        byte hue = map(winAnimationTimer.getRemaining() % (WIN_CELEBRATE_DURATION / 2), 0, WIN_CELEBRATE_DURATION / 2, 0, 255);
-        Color rainbowCol = makeColorHSB(hue,255,255);
-        if(winAnimationTimer.getRemaining() > WIN_CELEBRATE_DURATION / 2) {
-          setColor(rainbowCol);
-        }
-        else {
-          byte bri = map(winAnimationTimer.getRemaining(), 0, WIN_CELEBRATE_DURATION/2, 0, 255);
-          bri = easeInHelper(bri);
-          FOREACH_FACE(f){
-            setColorOnFace(dim(random(3)==0 ? rainbowCol : OFF, bri), f);
-          }
-        }
+  if(winAnimationPlayhead == 0) {
+    byte hue = map(winAnimationTimer.getRemaining() % (WIN_CELEBRATE_DURATION / 2), 0, WIN_CELEBRATE_DURATION / 2, 0, 255);
+    Color rainbowCol = makeColorHSB(hue,255,255);
+    if(winAnimationTimer.getRemaining() > WIN_CELEBRATE_DURATION / 2) {
+      setColor(rainbowCol);
+    }
+    else {
+      byte bri = map(winAnimationTimer.getRemaining(), 0, WIN_CELEBRATE_DURATION/2, 0, 255);
+      bri = easeInHelper(bri);
+      FOREACH_FACE(f){
+        setColorOnFace(dim(random(3)==0 ? rainbowCol : OFF, bri), f);
       }
-      break;
-    case 1:
-    case 2:
-    case 3:
-    case 4:
-      {
-        if(winAnimationTimer.getRemaining() <= CODE_DIGIT_SPACE_DURATION) {
-          setColor(OFF);
-        }
-        else {
-         byte bri = sin8_C(192 + 255*winAnimationTimer.getRemaining()/CODE_PULSE_DURATION);
-         setColor(dim(digitColors[winAnimationPlayhead-1], bri)); 
-        }
-      }
-      break;
-    default:
-      setColor(MAGENTA);
+    }
   }
+  else {
+    if(winAnimationTimer.getRemaining() <= CODE_DIGIT_SPACE_DURATION) {
+      setColor(OFF);
+    }
+    else {
+      byte bri = sin8_C(192 + 255*winAnimationTimer.getRemaining()/CODE_PULSE_DURATION);
+      setColor(dim(digitColors[winAnimationPlayhead-1], bri)); 
+    }
+  }  
 }
 
 void setWinAnimationTimer() {
@@ -261,6 +332,98 @@ void setWinAnimationTimer() {
   }
 }
 
+void sendNegotiationPacket(byte face, byte colorIndex, byte randomNum) {
+  byte packet[3] = {PKT_NEGOTIATE_COLOR, colorIndex, randomNum};
+  sendDatagramOnFace(packet, 3, face);
+}
+
+void sendSignaturePacket(byte face) {
+  byte packet[8] = {
+    PKT_COLOR_SIGNATURE,
+    faces[face].myColor,
+    faces[0].myColor,
+    faces[1].myColor,
+    faces[2].myColor,
+    faces[3].myColor,
+    faces[4].myColor,
+    faces[5].myColor
+  };
+  sendDatagramOnFace(packet, 8, face);
+}
+
+// ===== PACKAGE PROCESSING =====
+void processIncomingPackages() {
+  FOREACH_FACE(f) {
+    if (isDatagramReadyOnFace(f)) {
+      const byte* pkg = getDatagramOnFace(f);
+      byte pkgType = pkg[0];
+      
+      switch(pkgType) {
+
+        case PKT_NEGOTIATE_COLOR:
+          {
+            // Only process color negotiation when in SETUP mode
+            if (gameMode != SETUP) {
+              break;  // Ignore negotiation packets when not in SETUP
+            }
+            
+            // Also check that neighbor is in SETUP mode
+            byte neighborData = getLastValueReceivedOnFace(f);
+            byte neighborMode = getGameMode(neighborData);
+            if (neighborMode != SETUP) {
+              break;  // Ignore if neighbor isn't in SETUP either
+            }
+            
+            // Process negotiation packet if we're in NEG_INERT or NEG_SENT state
+            if(faces[f].negotiationState == FaceState::NEG_IDLE || faces[f].negotiationState == FaceState::NEG_SENT) {
+              byte neighborColor = pkg[1];
+              byte neighborNumber = pkg[2];
+              
+              // If we haven't sent our proposal yet, send it now
+              if(faces[f].negotiationState == FaceState::NEG_IDLE) {
+                faces[f].negotiationNum = random(MAX_NEG_NUM);
+                faces[f].proposedColor = 1 + random(NUM_GAME_COLORS - 1);
+                sendNegotiationPacket(f, faces[f].proposedColor, faces[f].negotiationNum);
+              }
+              
+              // Decide on final color based on who has higher number
+              if(neighborNumber > faces[f].negotiationNum) {
+                faces[f].myColor = neighborColor;
+              } else if(neighborNumber < faces[f].negotiationNum) {
+                faces[f].myColor = faces[f].proposedColor;
+              } else {
+                // Tie-breaker: use lower color index for consistency
+                faces[f].myColor = (faces[f].proposedColor < neighborColor) ? faces[f].proposedColor : neighborColor;
+              }
+              
+              // Store agreed color
+              faces[f].currentNeighbor.faceColor = faces[f].myColor;
+              faces[f].negotiationState = FaceState::NEG_RECEIVED;
+            }
+            // If we already received their packet, mark negotiation complete
+            else if(faces[f].negotiationState == FaceState::NEG_RECEIVED) {
+              faces[f].negotiationState = FaceState::NEG_COMPLETE;
+            }
+          }
+          break;
+
+        case PKT_COLOR_SIGNATURE:
+          // nothing to do here yet.
+          break;                 
+      }
+      
+      markDatagramReadOnFace(f);
+    }
+  }
+  
+  // Send a second packet to confirm negotiation complete
+  FOREACH_FACE(f) {
+    if(faces[f].negotiationState == FaceState::NEG_RECEIVED) {
+      sendNegotiationPacket(f, faces[f].proposedColor, faces[f].negotiationNum);
+      faces[f].negotiationState = FaceState::NEG_COMPLETE;
+    }
+  }
+}
 
 /*
    pass this a game mode to switch to
@@ -272,6 +435,9 @@ void changeMode( byte mode ) {
   // handle any items that a game should do once when it changes
   if (gameMode == SETUP) {
     // reset puzzle
+    FOREACH_FACE(f){
+      faces[f].reset();
+    }
     amISolved = false;
   }
   else if (gameMode == PLAY) {
