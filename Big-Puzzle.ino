@@ -287,6 +287,10 @@ void setupLoop() {
       }  
     }
   }
+
+  if(isAlone()) {
+    setColor(dim(WHITE, brightness));
+  }
 }
 
 /*
