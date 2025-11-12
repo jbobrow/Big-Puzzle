@@ -45,6 +45,8 @@ Color gameColors[NUM_GAME_COLORS+1] = {OFF, TANGERINE, LEMON, MINT, GRAPE};  // 
 #define PERIOD_DURATION 2000
 #define BUFFER_DURATION 200
 
+#define PKT_BUFFER_DURATION 200
+
 Timer syncTimer;
 byte neighborSyncState[6];
 byte syncVal = 0;
@@ -76,6 +78,13 @@ struct Neighbor {
     return faceColor == 0;
   }
   
+  bool hasSignature() const {
+    FOREACH_FACE(f) {
+      if (signatureColors[f] != 0) return true;
+    }
+    return false;
+  }
+
   bool matches(const Neighbor& other) const {
     if (faceColor != other.faceColor) return false;
     for (byte i = 0; i < FACE_COUNT; i++) {
@@ -91,7 +100,7 @@ struct FaceState {
   byte negotiationNum;      // Random number for color negotiation
   byte proposedColor;       // Our proposed color
   byte myColor;
-  
+
   enum NegState {
     NEG_IDLE,
     NEG_SENT,
@@ -100,10 +109,17 @@ struct FaceState {
   } negotiationState;
   
   enum SigState {
-    SIG_NONE,
+    SIG_IDLE,
     SIG_SENT,
     SIG_RECEIVED
-  } signatureState;
+  } mySignatureState;
+
+  void lockSolution() {
+    solutionNeighbor.faceColor = currentNeighbor.faceColor;
+    FOREACH_FACE(f){
+      solutionNeighbor.signatureColors[f] = currentNeighbor.signatureColors[f];
+    }
+  }
   
   void reset() {
     currentNeighbor.clear();
@@ -112,13 +128,14 @@ struct FaceState {
     proposedColor = 0;
     myColor = 0;
     negotiationState = NEG_IDLE;
-    signatureState = SIG_NONE;
+    mySignatureState = SIG_IDLE;
   }  
 };
 
 enum PacketType {
   PKT_NEGOTIATE_COLOR = 0,
-  PKT_COLOR_SIGNATURE = 1
+  PKT_COLOR_SIGNATURE = 1,
+  PKT_SIGNATURE_ACK = 2
 };
 
 State signalState = INERT;
@@ -133,7 +150,7 @@ bool amISolved = false;
 
 FaceState faces[FACE_COUNT];
 
-byte myColors[FACE_COUNT];
+byte wasDataReceived[6] = {};
 
 bool readyToSolve;
 
@@ -199,6 +216,8 @@ void setupLoop() {
     changeMode(PLAY);  // change game mode on all Blinks
   }
 
+  bool newNeighborhood = false;
+
   FOREACH_FACE(f) {
     if (!isValueReceivedOnFaceExpired(f)) { // a neighbor!
       if (faces[f].currentNeighbor.isEmpty()) {  // a new neighbor!
@@ -209,13 +228,52 @@ void setupLoop() {
           faces[f].negotiationState = FaceState::NEG_SENT;
         }
       }
+      if(faces[f].mySignatureState == FaceState::SIG_IDLE && faces[f].negotiationState == FaceState::NEG_COMPLETE) {
+//        sendSignaturePacket(f);
+//        faces[f].mySignatureState == FaceState::SIG_SENT;
+        newNeighborhood = true;
+      }
     }
     else { // no neighor
+      if(!faces[f].currentNeighbor.isEmpty()) {
+        newNeighborhood = true;
+      }
       faces[f].reset();
     }
 
     // display color on face
     setColorOnFace(dim(gameColors[faces[f].myColor], 127 + brightness/2),f);
+
+//     // let's see what state the signature exchange is in
+//     if(faces[f].mySignatureState == FaceState::SIG_IDLE) {
+//       setColorOnFace(YELLOW, f);
+//     }else if(faces[f].mySignatureState == FaceState::SIG_SENT) {
+//       setColorOnFace(BLUE, f);
+//     }else if(faces[f].mySignatureState == FaceState::SIG_RECEIVED) {
+//       setColorOnFace(GREEN, f);
+//     }
+//
+//    if(faces[f].currentNeighbor.hasSignature()) {
+//      setColorOnFace(GREEN, f);
+//    }
+//
+//    // DEBUG: PACKET DATA VIS
+//    if(wasDataReceived[f]){
+//      setColorOnFace(RED, f);
+//      wasDataReceived[f] = false;
+//    }
+
+  }
+
+  // share the updated signature
+  if(newNeighborhood) {
+    // send my signature to all neighbors
+    FOREACH_FACE(f) {
+      if (!isValueReceivedOnFaceExpired(f)) { // a neighbor!
+        sendSignaturePacket(f);
+        faces[f].mySignatureState == FaceState::SIG_SENT;
+      }  
+    }
   }
 }
 
@@ -224,30 +282,91 @@ void setupLoop() {
 */
 void playLoop() {
 
-  // button press = individual solved
-  // listen for collective solution
-
-  // changeMode(WIN);
-
-  // check and dump button pressed during gameplay
-  if (buttonPressed()) {
-    amISolved = !amISolved;
-  }
-
-  // check collective win condition
-  updateWinDistance();
-
-  if(amISolved && inverseDistanceFromUnsolved == 0) {
+  // Manual trigger win condition
+  if(buttonDoubleClicked()) {
     changeMode(WIN);
   }
 
-  if(amISolved) {
-    // setColor(WHITE);
-    Color distColor = makeColorHSB(16 * (MAX_SOLVE_DISTANCE - inverseDistanceFromUnsolved), 255, 255);
-    setColor(dim(distColor,brightness));
+  if(isAlone()) {
+    readyToSolve = true;
+  }
+
+  // display state
+  if(!readyToSolve) {
+    FOREACH_FACE(f) {
+      if(!isValueReceivedOnFaceExpired(f)) {
+        setColorOnFace(dim(WHITE,brightness), f);
+      }
+    }
   }
   else {
-    setColor(OFF);
+
+    bool newNeighborhood = false;
+
+    FOREACH_FACE(f) {
+      if (!isValueReceivedOnFaceExpired(f)) { // a neighbor!
+        if(faces[f].mySignatureState != FaceState::SIG_RECEIVED) {  // PENDING CHANGE (GUESS!!!! THIS DID IT)
+          newNeighborhood = true;
+        }
+      }
+      else { // no neighor
+        if(!faces[f].currentNeighbor.isEmpty()) {
+          newNeighborhood = true;
+        }
+        faces[f].currentNeighbor.clear();
+        faces[f].mySignatureState = FaceState::SIG_IDLE;
+      }
+    }
+
+    if(newNeighborhood) {
+      // send my signature to all neighbors
+      FOREACH_FACE(f) {
+        if (!isValueReceivedOnFaceExpired(f)) { // a neighbor!
+          sendSignaturePacket(f);
+          faces[f].mySignatureState == FaceState::SIG_SENT;
+        }  
+      }
+    }
+
+    amISolved = isAllFacesSolved();
+
+    // check collective win condition
+    updateWinDistance();
+    
+    if(readyToSolve && amISolved && inverseDistanceFromUnsolved == 0) {
+        changeMode(WIN);
+    }
+
+    FOREACH_FACE(f) {
+      // display color on face
+      if(amISolved) { //AND HINTING
+        if(faces[f].myColor != 0) {
+          setColorOnFace(dim(GREEN, brightness), f);
+        }
+        else {
+          setColorOnFace(OFF, f);
+        }
+      }
+      else if(faces[f].currentNeighbor.faceColor == faces[f].myColor){
+        setColorOnFace(dim(gameColors[faces[f].myColor], brightness),f);
+      }
+      else {
+        setColorOnFace(gameColors[faces[f].myColor],f);
+      }
+
+//      if(faces[f].solutionNeighbor.matches(faces[f].currentNeighbor)) {
+//        setColorOnFace(GREEN, f);
+//      }
+//      else {
+//        setColorOnFace(RED, f);
+//      }
+//
+//      // DEBUG: PACKET DATA VIS
+//      if(wasDataReceived[f]){
+//        setColorOnFace(BLUE, f);
+//        wasDataReceived[f] = false;
+//      }
+    }
   }
 }
 
@@ -273,6 +392,15 @@ void winLoop() {
   displayWinAnimation();
 }
 
+bool isAllFacesSolved() {
+  FOREACH_FACE(f) {
+    if(!faces[f].solutionNeighbor.matches(faces[f].currentNeighbor)){
+      return false; 
+    }
+  }
+  return true;
+}
+
 uint8_t easeInHelper(uint8_t A) {
     float t = A / 255.0f;
     float eased = sqrt(t);
@@ -280,29 +408,30 @@ uint8_t easeInHelper(uint8_t A) {
 }
 
 void displayWinAnimation() {
-  if(winAnimationPlayhead == 0) {
-    byte hue = map(winAnimationTimer.getRemaining() % (WIN_CELEBRATE_DURATION / 2), 0, WIN_CELEBRATE_DURATION / 2, 0, 255);
-    Color rainbowCol = makeColorHSB(hue,255,255);
-    if(winAnimationTimer.getRemaining() > WIN_CELEBRATE_DURATION / 2) {
-      setColor(rainbowCol);
-    }
-    else {
-      byte bri = map(winAnimationTimer.getRemaining(), 0, WIN_CELEBRATE_DURATION/2, 0, 255);
-      bri = easeInHelper(bri);
-      FOREACH_FACE(f){
-        setColorOnFace(dim(random(3)==0 ? rainbowCol : OFF, bri), f);
-      }
-    }
-  }
-  else {
-    if(winAnimationTimer.getRemaining() <= CODE_DIGIT_SPACE_DURATION) {
-      setColor(OFF);
-    }
-    else {
-      byte bri = sin8_C(192 + 255*winAnimationTimer.getRemaining()/CODE_PULSE_DURATION);
-      setColor(dim(digitColors[winAnimationPlayhead-1], bri)); 
-    }
-  }  
+  setColor(RED);
+  // if(winAnimationPlayhead == 0) {
+  //   byte hue = map(winAnimationTimer.getRemaining() % (WIN_CELEBRATE_DURATION / 2), 0, WIN_CELEBRATE_DURATION / 2, 0, 255);
+  //   Color rainbowCol = makeColorHSB(hue,255,255);
+  //   if(winAnimationTimer.getRemaining() > WIN_CELEBRATE_DURATION / 2) {
+  //     setColor(rainbowCol);
+  //   }
+  //   else {
+  //     byte bri = map(winAnimationTimer.getRemaining(), 0, WIN_CELEBRATE_DURATION/2, 0, 255);
+  //     bri = easeInHelper(bri);
+  //     FOREACH_FACE(f){
+  //       setColorOnFace(dim(random(3)==0 ? rainbowCol : OFF, bri), f);
+  //     }
+  //   }
+  // }
+  // else {
+  //   if(winAnimationTimer.getRemaining() <= CODE_DIGIT_SPACE_DURATION) {
+  //     setColor(OFF);
+  //   }
+  //   else {
+  //     byte bri = sin8_C(192 + 255*winAnimationTimer.getRemaining()/CODE_PULSE_DURATION);
+  //     setColor(dim(digitColors[winAnimationPlayhead-1], bri)); 
+  //   }
+  // }  
 }
 
 void setWinAnimationTimer() {
@@ -351,10 +480,16 @@ void sendSignaturePacket(byte face) {
   sendDatagramOnFace(packet, 8, face);
 }
 
+void sendSignatureAck(byte face) {
+  byte packet[1] = {PKT_SIGNATURE_ACK};
+  sendDatagramOnFace(packet, 1, face);
+}
+
 // ===== PACKAGE PROCESSING =====
 void processIncomingPackages() {
   FOREACH_FACE(f) {
     if (isDatagramReadyOnFace(f)) {
+      wasDataReceived[f] = true;
       const byte* pkg = getDatagramOnFace(f);
       byte pkgType = pkg[0];
       
@@ -408,8 +543,32 @@ void processIncomingPackages() {
           break;
 
         case PKT_COLOR_SIGNATURE:
-          // nothing to do here yet.
-          break;                 
+          {
+            // store the signature we received
+            faces[f].currentNeighbor.faceColor = pkg[1];
+            faces[f].currentNeighbor.signatureColors[0] = pkg[2];
+            faces[f].currentNeighbor.signatureColors[1] = pkg[3];
+            faces[f].currentNeighbor.signatureColors[2] = pkg[4];
+            faces[f].currentNeighbor.signatureColors[3] = pkg[5];
+            faces[f].currentNeighbor.signatureColors[4] = pkg[6];
+            faces[f].currentNeighbor.signatureColors[5] = pkg[7];
+            
+            // if we haven't sent our signature yet, let's do that
+            if(faces[f].mySignatureState == FaceState::SIG_IDLE) {
+              faces[f].mySignatureState = FaceState::SIG_SENT;
+            }
+
+            // let our neighbor know we received it so they can stop sending
+            sendSignatureAck(f);
+          }
+          break;
+        
+        case PKT_SIGNATURE_ACK:
+          {
+            // our neighbor let us know they recieved our signature, no need to send more
+            faces[f].mySignatureState = FaceState::SIG_RECEIVED;
+          }
+          break;
       }
       
       markDatagramReadOnFace(f);
@@ -421,6 +580,10 @@ void processIncomingPackages() {
     if(faces[f].negotiationState == FaceState::NEG_RECEIVED) {
       sendNegotiationPacket(f, faces[f].proposedColor, faces[f].negotiationNum);
       faces[f].negotiationState = FaceState::NEG_COMPLETE;
+    }
+
+    if(faces[f].mySignatureState == FaceState::SIG_SENT) {
+      sendSignaturePacket(f);
     }
   }
 }
@@ -439,9 +602,15 @@ void changeMode( byte mode ) {
       faces[f].reset();
     }
     amISolved = false;
+    readyToSolve = false;
   }
   else if (gameMode == PLAY) {
-    // initiate signature swap
+    // save puzzle solution
+    FOREACH_FACE(f) {
+      faces[f].lockSolution();
+      faces[f].myColor = faces[f].solutionNeighbor.faceColor;
+      faces[f].mySignatureState = FaceState::SIG_IDLE;
+    }
   }
   else if (gameMode == WIN) {
     // reset win animation
