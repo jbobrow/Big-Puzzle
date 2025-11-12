@@ -7,7 +7,7 @@
 // ===================== SECRET CODE =======================
 // =========================================================
 #define CODE_LENGTH 4 // NUMBER OF DIGITS IN THE SECRET CODE
-byte secretCode[CODE_LENGTH] = {4, 2, 4, 2}; // REPLACE THIS
+byte secretCode[CODE_LENGTH] = {1, 2, 3, 4}; // REPLACE THIS
 // =========================================================
 // =========================================================
 // =========================================================
@@ -449,29 +449,15 @@ void displayWinAnimation() {
 
 void setWinAnimationTimer() {
   uint32_t duration;
-  switch(winAnimationPlayhead) {
-    case 0:
-      winAnimationTimer.set(WIN_CELEBRATE_DURATION);
-      break;
-    case 1:
-      duration = secretCode[0]*(CODE_PULSE_DURATION)+CODE_DIGIT_SPACE_DURATION;
-      winAnimationTimer.set(duration);
-      break;
-    case 2:
-      duration = secretCode[1]*(CODE_PULSE_DURATION)+CODE_DIGIT_SPACE_DURATION;
-      winAnimationTimer.set(duration);
-      break;
-    case 3:
-      duration = secretCode[2]*(CODE_PULSE_DURATION)+CODE_DIGIT_SPACE_DURATION;
-      winAnimationTimer.set(duration);
-      break;
-    case 4:
-      duration = secretCode[3]*(CODE_PULSE_DURATION)+CODE_DIGIT_SPACE_DURATION;
-      winAnimationTimer.set(duration);
-      break;
-    default:
-      winAnimationTimer.never();
+
+  if(winAnimationPlayhead == 0) {
+    duration = WIN_CELEBRATE_DURATION;
   }
+  else {
+    duration = secretCode[winAnimationPlayhead-1]*(CODE_PULSE_DURATION)+CODE_DIGIT_SPACE_DURATION;
+  }
+
+  winAnimationTimer.set(duration);
 }
 
 void sendNegotiationPacket(byte face, byte colorIndex, byte randomNum) {
