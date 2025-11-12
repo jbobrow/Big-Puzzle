@@ -69,8 +69,8 @@ struct Neighbor {
   
   void clear() {
     faceColor = 0;
-    for (byte i = 0; i < FACE_COUNT; i++) {
-      signatureColors[i] = 0;
+    FOREACH_FACE(f){
+      signatureColors[f] = 0;
     }
   }
   
@@ -87,8 +87,8 @@ struct Neighbor {
 
   bool matches(const Neighbor& other) const {
     if (faceColor != other.faceColor) return false;
-    for (byte i = 0; i < FACE_COUNT; i++) {
-      if (signatureColors[i] != other.signatureColors[i]) return false;
+    FOREACH_FACE(f) {
+      if (signatureColors[f] != other.signatureColors[f]) return false;
     }
     return true;
   }
