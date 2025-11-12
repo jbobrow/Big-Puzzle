@@ -1,7 +1,17 @@
-// Distributed Win & State Change Example
-// 1. Shared Game Mode Across All Blinks
-// 2. Distance Based Collective Win State
-// 3. Time Synchronized Animation
+/*
+  Big Puzzle - Curious Levity
+
+  The following code adapts the game Puzzle101, to a larger format
+
+  1. Puzzle101 style puzzle for any number of Blinks (user locks in puzzle)
+  2. Solution state celebration (recognize global solution and celebrate)
+  3. Communicate secret code through flashing
+  4. BONUS: Press any Blink in the win condition, it's toy time.
+  
+  Designed with Paul Levy & Brandon Bozzi
+  Code by: Jonathan Bobrow & Ivan Ivanov
+  2025.11.12
+*/
 
 // =========================================================
 // ===================== SECRET CODE =======================
