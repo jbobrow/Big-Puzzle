@@ -87,10 +87,20 @@ struct Neighbor {
 
   bool matches(const Neighbor& other) const {
     if (faceColor != other.faceColor) return false;
-    FOREACH_FACE(f) {
-      if (signatureColors[f] != other.signatureColors[f]) return false;
+    
+    // Check if other.signatureColors is a rotation of signatureColors
+    for (int rotation = 0; rotation < FACE_COUNT; rotation++) {
+      bool rotationMatches = true;
+      for (int i = 0; i < FACE_COUNT; i++) {
+        if (signatureColors[i] != other.signatureColors[(i + rotation) % FACE_COUNT]) {
+          rotationMatches = false;
+          break;
+        }
+      }
+      if (rotationMatches) return true;
     }
-    return true;
+    
+    return false;
   }
 };
 
