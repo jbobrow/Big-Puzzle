@@ -13,9 +13,11 @@ byte secretCode[CODE_LENGTH] = {4, 2, 4, 2}; // REPLACE THIS
 // =========================================================
 // =========================================================
 
+bool showHints = false;
+
 #define NUM_GAME_COLORS 4
-#define CODE_PULSE_DURATION         2000 // MILLISECONDS FOR BLINK PERIOD
-#define CODE_DIGIT_SPACE_DURATION   2000 // MILLISECONDS FOR SPACE BETWEEN DIGITS
+#define CODE_PULSE_DURATION         1200 // MILLISECONDS FOR BLINK PERIOD
+#define CODE_DIGIT_SPACE_DURATION   1200 // MILLISECONDS FOR SPACE BETWEEN DIGITS
 #define WIN_CELEBRATE_DURATION      4000 // MILLISECONDS FOR FIREWORKS
 Timer winAnimationTimer;
 byte winAnimationPlayhead = 0;
@@ -292,9 +294,15 @@ void setupLoop() {
 */
 void playLoop() {
 
-  // Manual trigger win condition
-  if(buttonDoubleClicked()) {
-    changeMode(WIN);
+  // Manual trigger win condition w/ 4 clicks
+  // Return to setup w/ 6 clicks
+  if(buttonMultiClicked()) {
+    if(buttonClickCount() == 4) {
+      changeMode(WIN);
+    }
+    else if(buttonClickCount() == 6) {
+      changeMode(SETUP);
+    }
   }
 
   if(isAlone()) {
@@ -349,7 +357,7 @@ void playLoop() {
 
     FOREACH_FACE(f) {
       // display color on face
-      if(amISolved) { //AND HINTING
+      if(amISolved && showHints) { //AND HINTING
         if(faces[f].myColor != 0) {
           setColorOnFace(dim(GREEN, brightness), f);
         }
@@ -389,8 +397,11 @@ void winLoop() {
     changeMode(WIN);
   }
 
-  if (buttonDoubleClicked()) {
-    changeMode(SETUP);
+  // Return to setup with 6 clicks
+  if(buttonMultiClicked()) {
+    if(buttonClickCount() == 6) {
+      changeMode(SETUP);
+    }
   }
 
   if(winAnimationTimer.isExpired()){
@@ -411,37 +422,29 @@ bool isAllFacesSolved() {
   return true;
 }
 
-uint8_t easeInHelper(uint8_t A) {
-    float t = A / 255.0f;
-    float eased = sqrt(t);
-    return (uint8_t)(eased * 255.0f + 0.5f); // round to nearest
-}
-
 void displayWinAnimation() {
-  setColor(RED);
-  // if(winAnimationPlayhead == 0) {
-  //   byte hue = map(winAnimationTimer.getRemaining() % (WIN_CELEBRATE_DURATION / 2), 0, WIN_CELEBRATE_DURATION / 2, 0, 255);
-  //   Color rainbowCol = makeColorHSB(hue,255,255);
-  //   if(winAnimationTimer.getRemaining() > WIN_CELEBRATE_DURATION / 2) {
-  //     setColor(rainbowCol);
-  //   }
-  //   else {
-  //     byte bri = map(winAnimationTimer.getRemaining(), 0, WIN_CELEBRATE_DURATION/2, 0, 255);
-  //     bri = easeInHelper(bri);
-  //     FOREACH_FACE(f){
-  //       setColorOnFace(dim(random(3)==0 ? rainbowCol : OFF, bri), f);
-  //     }
-  //   }
-  // }
-  // else {
-  //   if(winAnimationTimer.getRemaining() <= CODE_DIGIT_SPACE_DURATION) {
-  //     setColor(OFF);
-  //   }
-  //   else {
-  //     byte bri = sin8_C(192 + 255*winAnimationTimer.getRemaining()/CODE_PULSE_DURATION);
-  //     setColor(dim(digitColors[winAnimationPlayhead-1], bri)); 
-  //   }
-  // }  
+   if(winAnimationPlayhead == 0) {
+     byte hue = map(winAnimationTimer.getRemaining() % (WIN_CELEBRATE_DURATION / 2), 0, WIN_CELEBRATE_DURATION / 2, 0, 255);
+     Color rainbowCol = makeColorHSB(hue,255,255);
+     if(winAnimationTimer.getRemaining() > WIN_CELEBRATE_DURATION / 2) {
+       setColor(rainbowCol);
+     }
+     else {
+       byte bri = map(winAnimationTimer.getRemaining(), 0, WIN_CELEBRATE_DURATION/2, 0, 255);
+       FOREACH_FACE(f){
+         setColorOnFace(dim(random(3)==0 ? rainbowCol : OFF, bri), f);
+       }
+     }
+   }
+   else {
+     if(winAnimationTimer.getRemaining() <= CODE_DIGIT_SPACE_DURATION) {
+       setColor(OFF);
+     }
+     else {
+       byte bri = sin8_C(192 + 255*winAnimationTimer.getRemaining()/CODE_PULSE_DURATION);
+       setColor(dim(digitColors[winAnimationPlayhead-1], bri)); 
+     }
+   }  
 }
 
 void setWinAnimationTimer() {
