@@ -308,6 +308,11 @@ void setupLoop() {
 */
 void playLoop() {
 
+  // turn hints on or off with doubleclick (only on this Blink)
+  if(buttonDoubleClicked()) {
+    showHints = !showHints;
+  }
+
   // Manual trigger win condition w/ 4 clicks
   // Return to setup w/ 6 clicks
   if(buttonMultiClicked()) {
