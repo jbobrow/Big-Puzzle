@@ -245,7 +245,7 @@ void setupLoop() {
       if (faces[f].currentNeighbor.isEmpty()) {  // a new neighbor!
         if(faces[f].negotiationState == FaceState::NEG_IDLE) {
           faces[f].negotiationNum = random(MAX_NEG_NUM);
-          faces[f].proposedColor = 1 + random(NUM_GAME_COLORS - 1);
+          faces[f].proposedColor = 1 + random(NUM_GAME_COLORS);
           sendNegotiationPacket(f, faces[f].proposedColor, faces[f].negotiationNum);
           faces[f].negotiationState = FaceState::NEG_SENT;
         }
@@ -293,8 +293,8 @@ void setupLoop() {
     FOREACH_FACE(f) {
       if (!isValueReceivedOnFaceExpired(f)) { // a neighbor!
         sendSignaturePacket(f);
-        faces[f].mySignatureState == FaceState::SIG_SENT;
-      }  
+        faces[f].mySignatureState = FaceState::SIG_SENT;
+      }
     }
   }
 
@@ -360,8 +360,8 @@ void playLoop() {
       FOREACH_FACE(f) {
         if (!isValueReceivedOnFaceExpired(f)) { // a neighbor!
           sendSignaturePacket(f);
-          faces[f].mySignatureState == FaceState::SIG_SENT;
-        }  
+          faces[f].mySignatureState = FaceState::SIG_SENT;
+        }
       }
     }
 
@@ -535,7 +535,7 @@ void processIncomingPackages() {
               // If we haven't sent our proposal yet, send it now
               if(faces[f].negotiationState == FaceState::NEG_IDLE) {
                 faces[f].negotiationNum = random(MAX_NEG_NUM);
-                faces[f].proposedColor = 1 + random(NUM_GAME_COLORS - 1);
+                faces[f].proposedColor = 1 + random(NUM_GAME_COLORS);
                 sendNegotiationPacket(f, faces[f].proposedColor, faces[f].negotiationNum);
               }
               
@@ -624,6 +624,7 @@ void changeMode( byte mode ) {
   }
   else if (gameMode == PLAY) {
     // save puzzle solution
+    readyToSolve = true;
     FOREACH_FACE(f) {
       faces[f].lockSolution();
       faces[f].myColor = faces[f].solutionNeighbor.faceColor;
