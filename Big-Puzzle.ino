@@ -32,12 +32,14 @@ bool showHints = false;
 Timer winAnimationTimer;
 byte winAnimationPlayhead = 0;
 
-#define TANGERINE makeColorHSB(22,255,255)
-#define LEMON     makeColorHSB(49,255,255)
-#define MINT      makeColorHSB(99,255,255)
-#define GRAPE     makeColorHSB(200,255,255) 
-#define LIME      makeColorHSB(82,255,255)
-#define BLUEBERRY makeColorHSB(160,255,255)
+// Exactly what makeColorHSB(hue,255,255) gives, written as constants so the color tables
+// below are filled in at compile time instead of by code that runs at startup (saves flash)
+#define TANGERINE MAKECOLOR_5BIT_RGB(31,16, 0)  // makeColorHSB( 22,255,255)
+#define LEMON     MAKECOLOR_5BIT_RGB(27,31, 0)  // makeColorHSB( 49,255,255)
+#define MINT      MAKECOLOR_5BIT_RGB( 0,31,10)  // makeColorHSB( 99,255,255)
+#define GRAPE     MAKECOLOR_5BIT_RGB(22, 0,31)  // makeColorHSB(200,255,255)
+#define LIME      MAKECOLOR_5BIT_RGB( 2,31, 0)  // makeColorHSB( 82,255,255)
+#define BLUEBERRY MAKECOLOR_5BIT_RGB( 0, 7,31)  // makeColorHSB(160,255,255)
 
 Color digitColors[CODE_LENGTH] = {TANGERINE, LEMON, MINT, GRAPE};  // ARRAY OF COLORS FOR EACH DIGIT POSITION
 Color gameColors[NUM_GAME_COLORS+1] = {OFF, TANGERINE, LEMON, MINT, GRAPE};  // ARRAY OF COLORS FOR PUZZLE
@@ -57,7 +59,71 @@ Color gameColors[NUM_GAME_COLORS+1] = {OFF, TANGERINE, LEMON, MINT, GRAPE};  // 
 #define PERIOD_DURATION 2000
 #define BUFFER_DURATION 200
 
-#define PKT_BUFFER_DURATION 200
+// DATAGRAMS
+// blinklib keeps ONE outgoing datagram per face, and a pending datagram is sent INSTEAD of
+// the face value. So: never queue two datagrams on a face in the same loop (the second
+// overwrites the first), and don't flood (the face value - mode, GO/RESOLVE, win
+// distance, sync - would never get through). One datagram goes out per interval, taking
+// turns between faces, only while a face still has something to deliver.
+#define DATAGRAM_INTERVAL 100
+Timer datagramTimer;
+
+// NEIGHBOR PRESENCE, counted in ticks of PRESENCE_TICK_MS
+//
+// GONE: a face is only treated as empty after it has heard nothing for a while. blinklib
+// expires a face after 200ms of silence, but a busy Blink (six neighbors, a datagram going
+// out) can take ~100ms per loop, so a face value can arrive just after 200ms even though
+// the neighbor never left. Dropping the edge then would restart its negotiation.
+//
+// SETTLE: when a face (re)connects, getLastValueReceivedOnFace() still holds the LAST value
+// heard on that face - possibly from a different Blink that was there before. A datagram
+// can even arrive (and mark the face connected) before the new neighbor's first face value.
+// So a face value is only trusted once the face has been connected for a moment.
+#define PRESENCE_TICK_MS      50
+#define NEIGHBOR_GONE_TICKS   12   // 600ms of silence
+#define NEIGHBOR_SETTLE_TICKS  5   // 250ms connected
+Timer presenceTimer;
+byte silentTicks[FACE_COUNT];      // ticks since we last heard this face (saturates)
+byte connectedTicks[FACE_COUNT];   // ticks this face has been connected without a gap (saturates)
+
+bool isNeighborGone(byte f) {
+  return silentTicks[f] >= NEIGHBOR_GONE_TICKS;
+}
+
+// connected, and connected long enough that its face value is really the neighbor's
+bool isNeighborValueFresh(byte f) {
+  return !isValueReceivedOnFaceExpired(f) && connectedTicks[f] >= NEIGHBOR_SETTLE_TICKS;
+}
+
+void updateNeighborPresence() {
+  if (!presenceTimer.isExpired()) return;
+  presenceTimer.set(PRESENCE_TICK_MS);
+
+  FOREACH_FACE(f) {
+    if (isValueReceivedOnFaceExpired(f)) {
+      connectedTicks[f] = 0;
+      if (silentTicks[f] < 255) silentTicks[f]++;
+    }
+    else {
+      silentTicks[f] = 0;
+      if (connectedTicks[f] < 255) connectedTicks[f]++;
+    }
+  }
+}
+
+// Per-face handshake flags (negotiation uses all three, signatures use GOT and REPLY)
+#define CH_GOT        1   // we have the neighbor's data
+#define CH_DELIVERED  2   // the neighbor told us it has our data
+#define CH_REPLY      4   // the neighbor asked us to confirm we have theirs
+
+// Flags carried in packets
+#define PF_HAVE_YOURS    1
+#define PF_NEED_CONFIRM  2
+
+// My signature (the colors on my six faces) changes during SETUP as faces are negotiated.
+// Each change bumps the version; a neighbor echoes back the version it holds, so we know
+// when it has our latest signature.
+byte sigVersion = 1;
 
 Timer syncTimer;
 byte neighborSyncState[6];
@@ -120,21 +186,12 @@ struct FaceState {
   Neighbor currentNeighbor;         // Current neighbor data
   Neighbor solutionNeighbor;        // Locked-in solution
   byte negotiationNum;      // Random number for color negotiation
-  byte proposedColor;       // Our proposed color
+  byte proposedColor;       // Our proposed color (0 = no proposal made yet)
   byte myColor;
-
-  enum NegState {
-    NEG_IDLE,
-    NEG_SENT,
-    NEG_RECEIVED,
-    NEG_COMPLETE
-  } negotiationState;
-  
-  enum SigState {
-    SIG_IDLE,
-    SIG_SENT,
-    SIG_RECEIVED
-  } mySignatureState;
+  byte negFlags;            // CH_* handshake flags for the color negotiation
+  byte sigFlags;            // CH_* handshake flags for the signature exchange
+  byte theirSigVersion;     // version of the neighbor's signature we hold (0 = none)
+  byte sigAcked;            // version of OUR signature the neighbor says it holds
 
   void lockSolution() {
     solutionNeighbor.faceColor = currentNeighbor.faceColor;
@@ -142,23 +199,31 @@ struct FaceState {
       solutionNeighbor.signatureColors[f] = currentNeighbor.signatureColors[f];
     }
   }
-  
-  void reset() {
+
+  // forget everything we learned from the neighbor on this face
+  void clearNeighbor() {
     currentNeighbor.clear();
+    sigFlags = 0;
+    theirSigVersion = 0;
+    sigAcked = 0;
+  }
+
+  void reset() {
+    clearNeighbor();
     solutionNeighbor.clear();
     negotiationNum = 0;
     proposedColor = 0;
     myColor = 0;
-    negotiationState = NEG_IDLE;
-    mySignatureState = SIG_IDLE;
-  }  
+    negFlags = 0;
+  }
 };
 
 enum PacketType {
-  PKT_NEGOTIATE_COLOR = 0,
-  PKT_COLOR_SIGNATURE = 1,
-  PKT_SIGNATURE_ACK = 2
+  PKT_NEGOTIATE_COLOR = 0,  // {type, proposedColor, negotiationNum, flags}
+  PKT_COLOR_SIGNATURE = 1   // {type | needConfirm<<4, faceColor, sig0<<4|sig1, sig2<<4|sig3, sig4<<4|sig5, myVersion, yourVersionIHave}
 };
+#define NEG_PKT_LEN 4
+#define SIG_PKT_LEN 7   // kept short: a Blink can't do anything else while it sends IR
 
 State signalState = INERT;
 
@@ -191,6 +256,9 @@ void loop() {
   syncLoop();
   brightness = sin8_C(map(syncTimer.getRemaining(), 0, PERIOD_DURATION, 0, 255));
   
+  // keep track of which faces still have a neighbor
+  updateNeighborPresence();
+
   // listen for packets
   processIncomingPackages();
 
@@ -220,9 +288,12 @@ void loop() {
       break;
   }
 
+  // send any datagrams still waiting to be delivered (rate limited)
+  sendPendingDatagrams();
+
   // communicate with neighbors
   // share both signalState (i.e. when to change) and the game mode
-  byte sendData = getBroadcastValue();  
+  byte sendData = getBroadcastValue();
   setValueSentOnAllFaces(sendData);
 
   resetUserInputs();
@@ -238,27 +309,15 @@ void setupLoop() {
     changeMode(PLAY);  // change game mode on all Blinks
   }
 
-  bool newNeighborhood = false;
-
   FOREACH_FACE(f) {
     if (!isValueReceivedOnFaceExpired(f)) { // a neighbor!
-      if (faces[f].currentNeighbor.isEmpty()) {  // a new neighbor!
-        if(faces[f].negotiationState == FaceState::NEG_IDLE) {
-          faces[f].negotiationNum = random(MAX_NEG_NUM);
-          faces[f].proposedColor = 1 + random(NUM_GAME_COLORS);
-          sendNegotiationPacket(f, faces[f].proposedColor, faces[f].negotiationNum);
-          faces[f].negotiationState = FaceState::NEG_SENT;
-        }
-      }
-      if(faces[f].mySignatureState == FaceState::SIG_IDLE && faces[f].negotiationState == FaceState::NEG_COMPLETE) {
-//        sendSignaturePacket(f);
-//        faces[f].mySignatureState == FaceState::SIG_SENT;
-        newNeighborhood = true;
+      if (faces[f].proposedColor == 0) {  // a new neighbor! propose a color for this edge
+        makeProposal(f);
       }
     }
-    else { // no neighor
-      if(!faces[f].currentNeighbor.isEmpty()) {
-        newNeighborhood = true;
+    else if (isNeighborGone(f)) { // no neighbor (for a while)
+      if (faces[f].myColor != 0) {
+        signatureChanged();  // this face lost its color, so my signature changed
       }
       faces[f].reset();
     }
@@ -267,12 +326,10 @@ void setupLoop() {
     setColorOnFace(dim(gameColors[faces[f].myColor], 127 + brightness/2),f);
 
 //     // let's see what state the signature exchange is in
-//     if(faces[f].mySignatureState == FaceState::SIG_IDLE) {
-//       setColorOnFace(YELLOW, f);
-//     }else if(faces[f].mySignatureState == FaceState::SIG_SENT) {
-//       setColorOnFace(BLUE, f);
-//     }else if(faces[f].mySignatureState == FaceState::SIG_RECEIVED) {
-//       setColorOnFace(GREEN, f);
+//     if(signatureNeedsSend(f)) {
+//       setColorOnFace(BLUE, f);        // neighbor doesn't have our latest signature yet
+//     }else if(faces[f].sigFlags & CH_GOT) {
+//       setColorOnFace(GREEN, f);       // both sides have each other's signature
 //     }
 //
 //    if(faces[f].currentNeighbor.hasSignature()) {
@@ -285,17 +342,6 @@ void setupLoop() {
 //      wasDataReceived[f] = false;
 //    }
 
-  }
-
-  // share the updated signature
-  if(newNeighborhood) {
-    // send my signature to all neighbors
-    FOREACH_FACE(f) {
-      if (!isValueReceivedOnFaceExpired(f)) { // a neighbor!
-        sendSignaturePacket(f);
-        faces[f].mySignatureState = FaceState::SIG_SENT;
-      }
-    }
   }
 
   if(isAlone()) {
@@ -324,8 +370,34 @@ void playLoop() {
     }
   }
 
-  if(isAlone()) {
+  // forget neighbors that left; a new neighbor's signature arrives by datagram
+  bool allGone = true;
+  FOREACH_FACE(f) {
+    if (isNeighborGone(f)) {
+      faces[f].clearNeighbor();
+    }
+    else {
+      allGone = false;
+    }
+  }
+
+  // A Blink becomes ready once it has been taken apart from the puzzle. Until then it must
+  // not trigger the win (the locked-in puzzle is trivially solved), but it still has to
+  // report honestly whether it is solved, or its neighbors could win while it is wrong.
+  // "Alone" uses the same rule we use to forget neighbors (not blinklib's quicker isAlone()),
+  // otherwise a Blink just lifted away would still remember its old neighbors and look solved.
+  if(allGone) {
     readyToSolve = true;
+  }
+
+  amISolved = isAllFacesSolved();
+
+  // check collective win condition
+  updateWinDistance();
+
+  if(readyToSolve && amISolved && inverseDistanceFromUnsolved == 0) {
+    changeMode(WIN);
+    return;
   }
 
   // display state
@@ -337,43 +409,6 @@ void playLoop() {
     }
   }
   else {
-
-    bool newNeighborhood = false;
-
-    FOREACH_FACE(f) {
-      if (!isValueReceivedOnFaceExpired(f)) { // a neighbor!
-        if(faces[f].mySignatureState != FaceState::SIG_RECEIVED) {  // PENDING CHANGE (GUESS!!!! THIS DID IT)
-          newNeighborhood = true;
-        }
-      }
-      else { // no neighor
-        if(!faces[f].currentNeighbor.isEmpty()) {
-          newNeighborhood = true;
-        }
-        faces[f].currentNeighbor.clear();
-        faces[f].mySignatureState = FaceState::SIG_IDLE;
-      }
-    }
-
-    if(newNeighborhood) {
-      // send my signature to all neighbors
-      FOREACH_FACE(f) {
-        if (!isValueReceivedOnFaceExpired(f)) { // a neighbor!
-          sendSignaturePacket(f);
-          faces[f].mySignatureState = FaceState::SIG_SENT;
-        }
-      }
-    }
-
-    amISolved = isAllFacesSolved();
-
-    // check collective win condition
-    updateWinDistance();
-    
-    if(readyToSolve && amISolved && inverseDistanceFromUnsolved == 0) {
-        changeMode(WIN);
-    }
-
     FOREACH_FACE(f) {
       // display color on face
       if(amISolved && showHints) { //AND HINTING
@@ -479,129 +514,142 @@ void setWinAnimationTimer() {
   winAnimationTimer.set(duration);
 }
 
-void sendNegotiationPacket(byte face, byte colorIndex, byte randomNum) {
-  byte packet[3] = {PKT_NEGOTIATE_COLOR, colorIndex, randomNum};
-  sendDatagramOnFace(packet, 3, face);
+// =========================================================
+// ================  NEIGHBOR DATAGRAMS  ===================
+// =========================================================
+//
+// Two exchanges happen with each neighbor:
+//  - SETUP: color negotiation. Both sides propose {color, random number}; the higher
+//    number wins (tie: lower color). Both compute the same answer from the two proposals.
+//  - SETUP & PLAY: signatures. Each side sends the colors of all six of its faces, so a
+//    neighbor can recognize WHICH Blink is touching it.
+//
+// Packets are not acknowledged with separate ACK packets (blinklib only holds one outgoing
+// datagram per face, so an ACK would overwrite the data packet queued after it, or vice
+// versa). Instead each packet says whether we have the other side's data and whether we
+// still need them to confirm ours. A face resends every DATAGRAM_INTERVAL until both sides
+// are confirmed, then goes quiet.
+
+void makeProposal(byte f) {
+  faces[f].negotiationNum = random(MAX_NEG_NUM);                // 0..MAX_NEG_NUM (blinklib's random() is inclusive)
+  faces[f].proposedColor = 1 + random(NUM_GAME_COLORS - 1);     // 1..NUM_GAME_COLORS
+  faces[f].negFlags = 0;
 }
 
-void sendSignaturePacket(byte face) {
-  byte packet[8] = {
-    PKT_COLOR_SIGNATURE,
-    faces[face].myColor,
-    faces[0].myColor,
-    faces[1].myColor,
-    faces[2].myColor,
-    faces[3].myColor,
-    faces[4].myColor,
-    faces[5].myColor
-  };
-  sendDatagramOnFace(packet, 8, face);
+void signatureChanged() {
+  sigVersion++;
+  if (sigVersion == 0) sigVersion = 1;  // 0 means "none"
 }
 
-void sendSignatureAck(byte face) {
-  byte packet[1] = {PKT_SIGNATURE_ACK};
-  sendDatagramOnFace(packet, 1, face);
+bool negotiationNeedsSend(byte f) {
+  return faces[f].proposedColor != 0 &&
+         (!(faces[f].negFlags & CH_DELIVERED) || (faces[f].negFlags & CH_REPLY));
 }
 
-// ===== PACKAGE PROCESSING =====
+bool signatureNeedsSend(byte f) {
+  return faces[f].sigAcked != sigVersion || (faces[f].sigFlags & CH_REPLY);
+}
+
+// One datagram per DATAGRAM_INTERVAL, taking turns between faces. Sending IR blocks the
+// Blink face by face (a signature takes ~40ms), so datagrams on all six faces at once would
+// stall it longer than the 200ms after which neighbors consider a face empty: they would
+// drop and renegotiate the edge, change their signature, and never settle.
+// On each face, negotiation goes first: the signature only means something once this edge
+// has its color.
+byte nextDatagramFace = 0;
+
+void sendPendingDatagrams() {
+  if (!datagramTimer.isExpired() || gameMode == WIN) return;
+
+  for (byte i = 0; i < FACE_COUNT; i++) {
+    byte f = nextDatagramFace;
+    nextDatagramFace = (f == FACE_COUNT - 1) ? 0 : f + 1;
+
+    if (isValueReceivedOnFaceExpired(f)) continue;
+
+    FaceState &fs = faces[f];
+    byte packet[SIG_PKT_LEN];
+    byte len;
+
+    if (gameMode == SETUP && negotiationNeedsSend(f)) {
+      // {type, proposedColor, negotiationNum, flags}
+      packet[0] = PKT_NEGOTIATE_COLOR;
+      packet[1] = fs.proposedColor;
+      packet[2] = fs.negotiationNum;
+      packet[3] = ((fs.negFlags & CH_GOT) ? PF_HAVE_YOURS : 0) | ((fs.negFlags & CH_DELIVERED) ? 0 : PF_NEED_CONFIRM);
+      len = NEG_PKT_LEN;
+      fs.negFlags &= ~CH_REPLY;
+    }
+    else if ((gameMode != SETUP || fs.myColor != 0) && signatureNeedsSend(f)) {
+      // {type | needConfirm<<4, faceColor, sig0<<4|sig1, sig2<<4|sig3, sig4<<4|sig5, myVersion, yourVersionIHave}
+      packet[0] = PKT_COLOR_SIGNATURE | ((fs.sigAcked != sigVersion) ? 0x10 : 0);
+      packet[1] = fs.myColor;
+      for (byte k = 0; k < 3; k++) {
+        packet[2 + k] = (faces[2 * k].myColor << 4) | faces[2 * k + 1].myColor;
+      }
+      packet[5] = sigVersion;
+      packet[6] = fs.theirSigVersion;
+      len = SIG_PKT_LEN;
+      fs.sigFlags &= ~CH_REPLY;
+    }
+    else {
+      continue;   // nothing to say on this face
+    }
+
+    sendDatagramOnFace(packet, len, f);
+    datagramTimer.set(DATAGRAM_INTERVAL);
+    return;
+  }
+}
+
+// ===== PACKET PROCESSING =====
 void processIncomingPackages() {
   FOREACH_FACE(f) {
     if (isDatagramReadyOnFace(f)) {
       wasDataReceived[f] = true;
       const byte* pkg = getDatagramOnFace(f);
-      byte pkgType = pkg[0];
-      
-      switch(pkgType) {
+      byte len = getDatagramLengthOnFace(f);
+      byte pkgType = pkg[0] & 0x0F;
+      FaceState &fs = faces[f];
 
-        case PKT_NEGOTIATE_COLOR:
-          {
-            // Only process color negotiation when in SETUP mode
-            if (gameMode != SETUP) {
-              break;  // Ignore negotiation packets when not in SETUP
-            }
-            
-            // Also check that neighbor is in SETUP mode
-            byte neighborData = getLastValueReceivedOnFace(f);
-            byte neighborMode = getGameMode(neighborData);
-            if (neighborMode != SETUP) {
-              break;  // Ignore if neighbor isn't in SETUP either
-            }
-            
-            // Process negotiation packet if we're in NEG_INERT or NEG_SENT state
-            if(faces[f].negotiationState == FaceState::NEG_IDLE || faces[f].negotiationState == FaceState::NEG_SENT) {
-              byte neighborColor = pkg[1];
-              byte neighborNumber = pkg[2];
-              
-              // If we haven't sent our proposal yet, send it now
-              if(faces[f].negotiationState == FaceState::NEG_IDLE) {
-                faces[f].negotiationNum = random(MAX_NEG_NUM);
-                faces[f].proposedColor = 1 + random(NUM_GAME_COLORS);
-                sendNegotiationPacket(f, faces[f].proposedColor, faces[f].negotiationNum);
-              }
-              
-              // Decide on final color based on who has higher number
-              if(neighborNumber > faces[f].negotiationNum) {
-                faces[f].myColor = neighborColor;
-              } else if(neighborNumber < faces[f].negotiationNum) {
-                faces[f].myColor = faces[f].proposedColor;
-              } else {
-                // Tie-breaker: use lower color index for consistency
-                faces[f].myColor = (faces[f].proposedColor < neighborColor) ? faces[f].proposedColor : neighborColor;
-              }
-              
-              // Store agreed color
-              faces[f].currentNeighbor.faceColor = faces[f].myColor;
-              faces[f].negotiationState = FaceState::NEG_RECEIVED;
-            }
-            // If we already received their packet, mark negotiation complete
-            else if(faces[f].negotiationState == FaceState::NEG_RECEIVED) {
-              faces[f].negotiationState = FaceState::NEG_COMPLETE;
-            }
-          }
-          break;
+      if (pkgType == PKT_NEGOTIATE_COLOR && len == NEG_PKT_LEN && gameMode == SETUP) {
+        // the neighbor may have noticed us before we noticed it
+        if (fs.proposedColor == 0) {
+          makeProposal(f);
+        }
 
-        case PKT_COLOR_SIGNATURE:
-          {
-            // store the signature we received
-            faces[f].currentNeighbor.faceColor = pkg[1];
-            faces[f].currentNeighbor.signatureColors[0] = pkg[2];
-            faces[f].currentNeighbor.signatureColors[1] = pkg[3];
-            faces[f].currentNeighbor.signatureColors[2] = pkg[4];
-            faces[f].currentNeighbor.signatureColors[3] = pkg[5];
-            faces[f].currentNeighbor.signatureColors[4] = pkg[6];
-            faces[f].currentNeighbor.signatureColors[5] = pkg[7];
-            
-            // if we haven't sent our signature yet, let's do that
-            if(faces[f].mySignatureState == FaceState::SIG_IDLE) {
-              faces[f].mySignatureState = FaceState::SIG_SENT;
-            }
+        // Decide on final color: the higher number wins; on a tie, the lower color index.
+        // Both sides compute this from the same two proposals, so they agree.
+        byte neighborColor = pkg[1];
+        byte neighborNumber = pkg[2];
+        byte agreed = fs.proposedColor;
+        if (neighborNumber > fs.negotiationNum ||
+            (neighborNumber == fs.negotiationNum && neighborColor < fs.proposedColor)) {
+          agreed = neighborColor;
+        }
+        if (fs.myColor != agreed) {
+          fs.myColor = agreed;
+          signatureChanged();
+        }
 
-            // let our neighbor know we received it so they can stop sending
-            sendSignatureAck(f);
-          }
-          break;
-        
-        case PKT_SIGNATURE_ACK:
-          {
-            // our neighbor let us know they recieved our signature, no need to send more
-            faces[f].mySignatureState = FaceState::SIG_RECEIVED;
-          }
-          break;
+        fs.negFlags |= CH_GOT;
+        if (pkg[3] & PF_HAVE_YOURS)   fs.negFlags |= CH_DELIVERED;
+        if (pkg[3] & PF_NEED_CONFIRM) fs.negFlags |= CH_REPLY;
       }
-      
-      markDatagramReadOnFace(f);
-    }
-  }
-  
-  // Send a second packet to confirm negotiation complete
-  FOREACH_FACE(f) {
-    if(faces[f].negotiationState == FaceState::NEG_RECEIVED) {
-      sendNegotiationPacket(f, faces[f].proposedColor, faces[f].negotiationNum);
-      faces[f].negotiationState = FaceState::NEG_COMPLETE;
-    }
+      else if (pkgType == PKT_COLOR_SIGNATURE && len == SIG_PKT_LEN && gameMode != WIN) {
+        // store the signature we received (two colors per byte)
+        fs.currentNeighbor.faceColor = pkg[1];
+        for (byte k = 0; k < 3; k++) {
+          fs.currentNeighbor.signatureColors[2 * k]     = pkg[2 + k] >> 4;
+          fs.currentNeighbor.signatureColors[2 * k + 1] = pkg[2 + k] & 0x0F;
+        }
+        fs.theirSigVersion = pkg[5];
+        fs.sigAcked = pkg[6];
+        fs.sigFlags |= CH_GOT;
+        if (pkg[0] >> 4) fs.sigFlags |= CH_REPLY;   // they need to hear that we have it
+      }
 
-    if(faces[f].mySignatureState == FaceState::SIG_SENT) {
-      sendSignaturePacket(f);
+      markDatagramReadOnFace(f);
     }
   }
 }
@@ -610,7 +658,7 @@ void processIncomingPackages() {
    pass this a game mode to switch to
 */
 void changeMode( byte mode ) {
-  gameMode = mode;  // change my own mode
+  gameMode = (Mode)mode;  // change my own mode
   signalState = GO; // signal my neighbors
 
   // handle any items that a game should do once when it changes
@@ -619,16 +667,17 @@ void changeMode( byte mode ) {
     FOREACH_FACE(f){
       faces[f].reset();
     }
+    signatureChanged();
     amISolved = false;
     readyToSolve = false;
+    inverseDistanceFromUnsolved = 0;
   }
   else if (gameMode == PLAY) {
-    // save puzzle solution
-    readyToSolve = true;
+    // save puzzle solution (myColor keeps the negotiated colors)
+    // readyToSolve stays false until this Blink has been taken apart from the puzzle
+    readyToSolve = false;
     FOREACH_FACE(f) {
       faces[f].lockSolution();
-      faces[f].myColor = faces[f].solutionNeighbor.faceColor;
-      faces[f].mySignatureState = FaceState::SIG_IDLE;
     }
   }
   else if (gameMode == WIN) {
@@ -647,7 +696,7 @@ void inertLoop() {
 
   //listen for neighbors in GO
   FOREACH_FACE(f) {
-    if (!isValueReceivedOnFaceExpired(f)) {//a neighbor!
+    if (isNeighborValueFresh(f)) {//a neighbor! (whose value is really its own, not left over)
       if (getSignalState(getLastValueReceivedOnFace(f)) == GO) {//a neighbor saying GO!
         byte neighborGameMode = getGameMode(getLastValueReceivedOnFace(f));
         changeMode(neighborGameMode);
@@ -689,68 +738,38 @@ void resolveLoop() {
   }
 }
 
+// Face value, low 5 bits (unchanged on the wire):
+//   0 INERT (SETUP or WIN), 1/2 SETUP GO/RESOLVE, 3/4 PLAY GO/RESOLVE,
+//   5..20 PLAY INERT with win distance 0..15, 21/22 WIN GO/RESOLVE
+// GO codes are odd, RESOLVE codes even.
+const byte COMM_CODE[2][3] = {
+  {COMM_SETUP_GO,      COMM_PLAY_GO,      COMM_WIN_GO},       // GO
+  {COMM_SETUP_RESOLVE, COMM_PLAY_RESOLVE, COMM_WIN_RESOLVE}   // RESOLVE
+};
+
 byte getSignalState(byte data) {
-    byte val = data & 31;
-    switch(val) {
-      case COMM_INERT:          return INERT;
-      case COMM_SETUP_GO:       return GO;
-      case COMM_SETUP_RESOLVE:  return RESOLVE;
-      case COMM_PLAY_GO:        return GO;
-      case COMM_PLAY_RESOLVE:   return RESOLVE;
-      case COMM_WIN_GO:         return GO;
-      case COMM_WIN_RESOLVE:    return RESOLVE;
-      default: {
-        // PLAY mode distance values (COMM_PLAY_BASE through COMM_PLAY_BASE + MAX_SOLVE_DISTANCE)
-        if (val >= COMM_PLAY_BASE && val < COMM_WIN_GO) {
-          return INERT;  // During stable PLAY with distance encoding, we're in INERT state
-        }
-        return INERT;
-      }
+  byte val = data & 31;
+  if (val == COMM_INERT || (val >= COMM_PLAY_BASE && val < COMM_WIN_GO) || val > COMM_WIN_RESOLVE) {
+    return INERT;
   }
+  return (val & 1) ? GO : RESOLVE;
 }
 
 byte getGameMode(byte data) {
-    byte val = data & 31;
-    switch(val) {
-      case COMM_INERT:          return SETUP;
-      case COMM_SETUP_GO:       return SETUP;
-      case COMM_SETUP_RESOLVE:  return SETUP;
-      case COMM_PLAY_GO:        return PLAY;
-      case COMM_PLAY_RESOLVE:   return PLAY;
-      case COMM_WIN_GO:         return WIN;
-      case COMM_WIN_RESOLVE:    return WIN;
-      default: {
-        // PLAY mode distance values (COMM_PLAY_BASE through COMM_PLAY_BASE + MAX_SOLVE_DISTANCE)
-        if (val >= COMM_PLAY_BASE && val < COMM_WIN_GO) {
-          return PLAY;
-        }
-        return SETUP;
-      }
-  }
+  byte val = data & 31;
+  if (val > COMM_WIN_RESOLVE) return SETUP;
+  if (val >= COMM_WIN_GO)     return WIN;
+  if (val >= COMM_PLAY_GO)    return PLAY;   // PLAY GO/RESOLVE and the distance values
+  return SETUP;
 }
 
 byte getBroadcastValue() {
-  byte val;
-  if(signalState == INERT) {
-      switch(gameMode) {
-        case SETUP: val = COMM_INERT; break;
-        case PLAY: val = COMM_PLAY_BASE + inverseDistanceFromUnsolved; break;
-        case WIN: val = COMM_INERT; break;
-      }
+  byte val = COMM_INERT;
+  if (signalState != INERT) {
+    val = COMM_CODE[signalState - 1][gameMode];
   }
-  else if (signalState == GO) {
-    switch(gameMode) {
-      case SETUP: val = COMM_SETUP_GO; break;
-      case PLAY: val = COMM_PLAY_GO; break;
-      case WIN: val = COMM_WIN_GO; break;
-    }
-  }
-  else if (signalState == RESOLVE) {
-    switch(gameMode) {
-      case SETUP: val = COMM_SETUP_RESOLVE; break;
-      case PLAY: val = COMM_PLAY_RESOLVE; break;
-      case WIN: val = COMM_WIN_RESOLVE; break;
-    } 
+  else if (gameMode == PLAY) {
+    val = COMM_PLAY_BASE + inverseDistanceFromUnsolved;
   }
   return (syncVal << 5) + val;
 }
@@ -768,19 +787,27 @@ void updateWinDistance() {
 
   FOREACH_FACE(f) {
     if (!isValueReceivedOnFaceExpired(f)) {
-      byte neighborData = getLastValueReceivedOnFace(f);
-      
-      byte neighborBroadcast = neighborData & 31; // Extract lower 5 bits
-      
-      // CRITICAL: Only process if neighbor is sending valid distance data
-      if (neighborBroadcast >= COMM_PLAY_BASE && neighborBroadcast < COMM_WIN_GO) {
-        byte neighborDistance = neighborBroadcast - COMM_PLAY_BASE;
-        if (neighborDistance > inverseDistanceFromUnsolved && neighborDistance > 0) {
-          inverseDistanceFromUnsolved = neighborDistance - 1;
+      byte neighborDistance = 0;
+
+      if (!isNeighborValueFresh(f)) {
+        // just connected: its value may be left over from a previous neighbor.
+        // Until we really hear from it, assume it is unsolved.
+        neighborDistance = MAX_SOLVE_DISTANCE;
+      }
+      else {
+        byte neighborBroadcast = getLastValueReceivedOnFace(f) & 31; // Extract lower 5 bits
+
+        // Only process if neighbor is sending valid distance data
+        if (neighborBroadcast >= COMM_PLAY_BASE && neighborBroadcast < COMM_WIN_GO) {
+          neighborDistance = neighborBroadcast - COMM_PLAY_BASE;
         }
       }
+
+      if (neighborDistance > inverseDistanceFromUnsolved && neighborDistance > 0) {
+        inverseDistanceFromUnsolved = neighborDistance - 1;
+      }
     }
-  } 
+  }
 }
 
 void syncLoop() {
